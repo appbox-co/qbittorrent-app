@@ -12,10 +12,15 @@ import tempfile
 import time
 import urllib.parse
 
-IMAGE = "repo.cylo.net/qbittorrent:5.2.4_2.0.15.0-5"
-OLD = "repo.cylo.net/qbittorrent@sha256:b41d7757d9c2c401367e2343b46c50dbf4eb5d562d1d3e912e792a2b59e825f4"
+IMAGE = "repo.cylo.net/qbittorrent:5.2.4_2.0.15.0-6"
+OLD = "repo.cylo.net/qbittorrent@sha256:757ae20ba44a289f03c760281d0ec36c831f598b75f8b62dea0f4a19dda7935a"
 if len(sys.argv) != 2 or sys.argv[1] != IMAGE:
     raise SystemExit("Unexpected image reference")
+# The builder's job id, if given, labels every container and volume.
+CYLO_JOB = os.environ.get("CYLO_JOB", "")
+if CYLO_JOB and not CYLO_JOB.replace("-", "").replace("_", "").isalnum():
+    raise SystemExit("Unexpected CYLO_JOB value")
+LABELS = ["--label", "cylo.job=" + CYLO_JOB] if CYLO_JOB else []
 PASSWORD = "GateA1! " + secrets.token_urlsafe(24) + " ' \" $"
 callback_count = 0
 # Appbox appends the per-install callback token to INSTANCE_ID.
@@ -42,7 +47,7 @@ atexit.register(cleanup)
 
 def volume(label):
     name = prefix + "-" + label
-    run(["docker", "volume", "create", "--label", f"appbox.release-gate={prefix}", name])
+    run(["docker", "volume", "create", "--label", f"appbox.release-gate={prefix}"] + LABELS + [name])
     volumes.append(name)
     return name
 
@@ -77,7 +82,7 @@ def launch(label, image, vol, interface="0"):
     containers.append(name)
     run(["docker", "run", "-d", "--platform", "linux/amd64", "--name", name,
          # Appbox bind-mounts an empty directory; do not copy the image's /torrents.
-         "--label", f"appbox.release-gate={prefix}",
+         "--label", f"appbox.release-gate={prefix}", *LABELS,
          "--mount", f"type=volume,source={vol},target=/torrents,volume-nocopy",
          "-v", stage.name + "/curl:/usr/local/bin/curl:ro", "-v", stage.name + ":/release-gate",
          "-e", "INSTANCE_ID=" + INSTANCE_ID, "-e", "PUID=1000", "-e", "PGID=1000",
@@ -370,8 +375,10 @@ for _ in range(30):
 else:
     raise RuntimeError("Synthetic torrent was not added")
 run(["docker", "exec", "--user", "1000:1000", baseline, "touch", "/torrents/completed/release-gate-preserved"])
-if disk_io(baseline) != POSIX:
-    raise RuntimeError("Baseline did not force POSIX disk I/O")
+if disk_io(baseline) != UNSET:
+    raise RuntimeError("Baseline set a disk I/O type")
+# A POSIX choice made on -5, after its one-time clear, must survive the upgrade.
+api(baseline, "app/setPreferences", 'json={"disk_io_type":2}')
 stop(baseline)
 upgrade = start("upgrade", IMAGE, upgrade_vol, "v5.2.4", "qui")
 verify(upgrade)
@@ -381,9 +388,9 @@ if json.loads(api(upgrade, "app/preferences"))["max_active_downloads"] != 17:
 if not any(t["hash"] == info_hash for t in json.loads(api(upgrade, "torrents/info"))):
     raise RuntimeError("Upgrade lost the existing torrent")
 run(["docker", "exec", upgrade, "test", "-f", "/torrents/completed/release-gate-preserved"])
-if disk_io(upgrade) != UNSET:
-    raise RuntimeError("Upgrade did not clear the forced POSIX disk I/O")
-# Recheck reads the payload through libtorrent's default disk I/O backend.
+if disk_io(upgrade) != POSIX:
+    raise RuntimeError("Upgrade replaced the chosen POSIX disk I/O type")
+# Recheck reads the payload through the chosen POSIX disk I/O backend.
 Path(stage.name, "release-gate-marker.txt").write_bytes(payload)
 run(["docker", "exec", "--user", "1000:1000", upgrade, "cp", "/release-gate/release-gate-marker.txt", "/torrents/completed/"])
 api(upgrade, "torrents/recheck", "hashes=" + info_hash)
@@ -400,7 +407,126 @@ verify(rollback)
 if not any(t["hash"] == info_hash for t in json.loads(api(rollback, "torrents/info"))):
     raise RuntimeError("Downgrade lost the existing torrent")
 run(["docker", "exec", rollback, "test", "-f", "/torrents/config/qui/qui.db"])
+if disk_io(rollback) != POSIX:
+    raise RuntimeError("Downgrade replaced the chosen POSIX disk I/O type")
 stop(rollback)
-print("PASS: upgrade from 5.2.4_2.0.15.0-4 to qui, torrent/preferences/files preserved, forced POSIX cleared, downgrade preserved state", flush=True)
+print("PASS: upgrade from 5.2.4_2.0.15.0-5 to qui, torrent/preferences/files and chosen POSIX disk I/O preserved, downgrade preserved state", flush=True)
+
+# --- qbtcheck: the no-public-seeding check -----------------------------------
+# Unit tests against the exact script and Python in the image.
+unit = prefix + "-qbtcheck-unit"
+containers.append(unit)
+run(["docker", "run", "--rm", "--platform", "linux/amd64", "--name", unit,
+     "--label", f"appbox.release-gate={prefix}", *LABELS,
+     "--entrypoint", "python3", "-e", "QBTCHECK_PATH=/defaults/qbtcheck",
+     "-v", str(Path(__file__).resolve().with_name("tests") / "test-qbtcheck.py") + ":/tmp/test-qbtcheck.py:ro",
+     IMAGE, "/tmp/test-qbtcheck.py"], timeout=120)
+containers.remove(unit)
+print("PASS: qbtcheck unit tests in the image", flush=True)
+
+# A private torrent (private flag set, passkey after /announce/, no query
+# string) and a public one, with the WebUI in French. -5 paused the private
+# torrent: its tracker message was translated and its URL matched neither
+# pattern. The new image must keep it seeding over several checks.
+QBTCHECK_KEY = secrets.token_hex(16)
+if QBTCHECK_KEY.startswith("an"):
+    QBTCHECK_KEY = "0" + QBTCHECK_KEY[1:]
+QBTCHECK_PRIVATE_ANNOUNCE = "https://tracker.qbtcheck-gate.invalid/announce/" + QBTCHECK_KEY
+QBTCHECK_PUBLIC_ANNOUNCE = "http://tracker.qbtcheck-gate.invalid:6969/announce"
+QBTCHECK_FRENCH_MSG = "Ce torrent est privé"
+SEEDING = ("uploading", "stalledUP", "forcedUP", "queuedUP")
+STOPPED = ("stoppedUP", "pausedUP")
+
+def bencoded_torrent(file_name, payload, announce, private):
+    """Return (info hash, .torrent bytes) for a single-piece, single-file torrent."""
+    info = (b"d6:lengthi%de4:name%d:%s12:piece lengthi16384e6:pieces20:%s"
+            % (len(payload), len(file_name), file_name, hashlib.sha1(payload).digest()))
+    if private:
+        info += b"7:privatei1e"
+    info += b"e"
+    return hashlib.sha1(info).hexdigest(), b"d8:announce%d:%s4:info%se" % (len(announce), announce, info)
+
+def torrent_states(name):
+    return {t["hash"]: t for t in json.loads(api(name, "torrents/info"))}
+
+def qbtcheck_fixture(label, image):
+    name = start("qbtcheck-" + label, image, volume("qbtcheck-" + label), "v5.2.4")
+    api(name, "app/setPreferences", 'json={"locale":"fr"}')
+    # qBittorrent loads its translation when it starts.
+    run(["docker", "restart", "-t", "30", name], timeout=45)
+    ready(name, "v5.2.4")
+    if json.loads(api(name, "app/preferences"))["locale"] != "fr":
+        raise RuntimeError("French locale was not kept")
+    torrents = {}
+    for kind, announce, private in (("private", QBTCHECK_PRIVATE_ANNOUNCE, True),
+                                    ("public", QBTCHECK_PUBLIC_ANNOUNCE, False)):
+        file_name = f"qbtcheck-{label}-{kind}.bin"
+        payload = f"qbtcheck release gate {label} {kind} {secrets.token_hex(32)}\n".encode()
+        info_hash, torrent = bencoded_torrent(file_name.encode(), payload, announce.encode(), private)
+        if private and b"7:privatei1e" not in torrent:
+            raise RuntimeError("Private fixture lacks the private flag")
+        Path(stage.name, file_name).write_bytes(payload)
+        Path(stage.name, file_name + ".torrent").write_bytes(torrent)
+        run(["docker", "exec", "--user", "1000:1000", name, "cp", "/release-gate/" + file_name, "/torrents/completed/"])
+        api(name, "app/version")  # refresh the session cookie used below
+        run(["docker", "exec", name, "/usr/bin/curl", "-fsS", "--max-time", "10",
+             "--cookie", "/tmp/release-gate-cookie", "-F", f"torrents=@/release-gate/{file_name}.torrent",
+             "-F", "savepath=/torrents/completed", "-F", "skip_checking=true", "-F", "stopped=false",
+             "http://127.0.0.1:8080/api/v2/torrents/add"])
+        torrents[kind] = (info_hash, file_name)
+    for _ in range(60):
+        states = torrent_states(name)
+        if all(h in states and states[h]["progress"] == 1 and states[h]["state"] in SEEDING
+               for h, _ in torrents.values()):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("qbtcheck fixtures did not start seeding")
+    if states[torrents["private"][0]]["private"] is not True or states[torrents["public"][0]]["private"] is not False:
+        raise RuntimeError("qBittorrent did not report the fixtures' private flags")
+    trackers = json.loads(api(name, "torrents/trackers?hash=" + torrents["private"][0]))
+    sticky = {t["msg"] for t in trackers if t["url"].startswith("** [")}
+    if sticky != {QBTCHECK_FRENCH_MSG}:
+        raise RuntimeError("Private tracker message was not translated: " + repr(sticky))
+    if QBTCHECK_PRIVATE_ANNOUNCE not in [t["url"] for t in trackers]:
+        raise RuntimeError("Private torrent lost its announce URL")
+    return name, torrents
+
+def qbtcheck_log(name, torrent, decision):
+    """Count checks that logged `decision` right after evaluating `torrent` as active and completed."""
+    info_hash, file_name = torrent
+    result = subprocess.run(["docker", "logs", name], capture_output=True, text=True, timeout=30)
+    lines = (result.stdout + result.stderr).splitlines()
+    seen = f"{info_hash[-6:]}: {file_name} active: (True) completed: (True)"
+    return sum(1 for i, line in enumerate(lines[:-1]) if line == seen and lines[i + 1] == decision)
+
+old_check, old_torrents = qbtcheck_fixture("old", OLD)
+new_check, new_torrents = qbtcheck_fixture("new", IMAGE)
+deadline = time.monotonic() + 600
+old_paused = False
+while True:
+    new_states = torrent_states(new_check)
+    if new_states[new_torrents["private"][0]]["state"] not in SEEDING:
+        raise RuntimeError("New image stopped the private torrent: " + new_states[new_torrents["private"][0]]["state"])
+    if not old_paused:
+        old_paused = torrent_states(old_check)[old_torrents["private"][0]]["state"] in STOPPED
+    checks = qbtcheck_log(new_check, new_torrents["private"], "Not pausing (private torrent), continuing...")
+    if checks >= 3 and old_paused:
+        break
+    if time.monotonic() > deadline:
+        raise RuntimeError(f"qbtcheck timed out: new image checks of the private torrent={checks}, "
+                           f"5.2.4_2.0.15.0-5 paused it={old_paused}")
+    time.sleep(10)
+if new_states[new_torrents["public"][0]]["state"] not in STOPPED:
+    raise RuntimeError("New image did not pause the public torrent: " + new_states[new_torrents["public"][0]]["state"])
+if qbtcheck_log(new_check, new_torrents["public"], "Public! Pausing...") < 1:
+    raise RuntimeError("qbtcheck did not log pausing the public torrent")
+if torrent_states(old_check)[old_torrents["public"][0]]["state"] not in STOPPED:
+    raise RuntimeError("5.2.4_2.0.15.0-5 did not pause the public torrent")
+print(f"PASS: qbtcheck kept the private torrent (French WebUI, /announce/<key>) seeding over {checks} checks "
+      "and paused the public one; 5.2.4_2.0.15.0-5 paused the same private torrent", flush=True)
+stop(old_check)
+stop(new_check)
+
 run([sys.executable, str(Path(__file__).with_name("registry-check.py")), IMAGE])
 print("PASS: registry precondition; image is ready to publish", flush=True)
