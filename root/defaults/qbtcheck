@@ -28,10 +28,68 @@ def release_lock(lockfile):
         os.remove(lockfile)
 
 def is_private(url):
-    pattern1 = '(http|https|udp)://[a-z0-9\.-]+\.[a-z]{2,13}((:[0-9]{2,5})|)/.*an.*\?.+=.+'
-    pattern2 = '(http|https|udp)://[a-z0-9\.-]+\.[a-z]{2,13}((:[0-9]{2,5})|)/.*[0-9a-zA-Z]{8,32}/an.*'
+    pattern1 = r'(http|https|udp)://[a-z0-9\.-]+\.[a-z]{2,13}((:[0-9]{2,5})|)/.*an.*\?.+=.+'
+    pattern2 = r'(http|https|udp)://[a-z0-9\.-]+\.[a-z]{2,13}((:[0-9]{2,5})|)/.*[0-9a-zA-Z]{8,32}/an.*'
     result=True if re.match(pattern1, url) or re.match(pattern2, url) else False
     return result
+
+# qBittorrent translates this tracker message into the WebUI language, so it
+# only matches when the interface is in English. It is a fallback only.
+PRIVATE_TRACKER_MSG = 'This torrent is private'
+
+def private_flag(info, properties=None):
+    """Return qBittorrent's private flag for a torrent: True, False, or None
+    when it cannot be read.
+
+    `info` is the torrent's torrents/info entry ("private" in qBittorrent 5.x)
+    and `properties`, when given, its torrents/properties result.
+    """
+    value = info.get('private')
+    if isinstance(value, bool):
+        return value
+    if properties is None:
+        return None
+    # "private" is null until the metadata is known, while the older
+    # "is_private" then reads false, so use "is_private" only without "private".
+    if 'private' in properties:
+        value = properties.get('private')
+    else:
+        value = properties.get('is_private')
+    return value if isinstance(value, bool) else None
+
+def tracker_says_private(trackers):
+    """The original check: the English tracker message or a passkey URL."""
+    for tracker in trackers:
+        if tracker.get('msg') == PRIVATE_TRACKER_MSG:
+            return True
+        if is_private(tracker.get('url') or ''):
+            return True
+    return False
+
+def should_pause(flag, trackers=()):
+    """Decide whether an active, completed torrent is public and must be paused.
+
+    Returns (pause, reason). A torrent whose own private flag is set keeps
+    seeding. When the flag cannot be read the torrent is left alone. Only a
+    torrent qBittorrent reports as not private goes on to the tracker checks.
+    """
+    if flag is True:
+        return False, 'private torrent'
+    if flag is not False:
+        return False, 'private flag unreadable, not pausing'
+    if tracker_says_private(trackers):
+        return False, 'private tracker'
+    return True, 'public'
+
+def read_private_flag(qbt_client, torrent):
+    flag = private_flag(torrent)
+    if flag is not None:
+        return flag
+    try:
+        return private_flag(torrent, qbt_client.torrents_properties(torrent_hash=torrent.hash))
+    except Exception as e:
+        print(f'Could not read torrent properties: {e}')
+        return None
 
 def delete_torrent_by_hash(hash_to_delete):
     """
@@ -55,6 +113,32 @@ def delete_torrent_by_hash(hash_to_delete):
     except Exception as e:
         print(f"Error deleting torrent with hash {hash_to_delete}: {e}. Ignoring error.")
     sys.exit(0)
+
+def check_torrents(qbt_client):
+    """Pause every active, completed torrent that is public."""
+    for torrent in qbt_client.torrents_info():
+        torrent_completed = bool(torrent.state_enum.is_complete)
+        torrent_active = bool(not torrent.state_enum.is_paused) and bool(not torrent.state_enum.is_checking) and bool(not torrent.state_enum.is_errored)
+
+        print(f'{torrent.hash[-6:]}: {torrent.name} active: ({torrent_active}) completed: ({torrent_completed})')
+
+        if not torrent_active:
+            print('Not active, continuing...')
+            continue
+        if not torrent_completed:
+            print('Not completed, continuing...')
+            continue
+
+        flag = read_private_flag(qbt_client, torrent)
+        # Trackers are only consulted for a torrent qBittorrent reports as public.
+        trackers = qbt_client.torrents_trackers(torrent.hash) if flag is False else ()
+        pause, reason = should_pause(flag, trackers)
+        if not pause:
+            print(f'Not pausing ({reason}), continuing...')
+            continue
+
+        print('Public! Pausing...')
+        qbt_client.torrents.pause(torrent_hashes=torrent.hash)
 
 def main_loop():
     qbt_client = qbittorrentapi.Client(host='localhost:8080', username='admin', password=os.getenv('PASSWORD'))
@@ -87,37 +171,7 @@ def main_loop():
     print(f'qBittorrent Web API: {qbt_client.app.web_api_version}')
 
     while True:
-        # Main logic of checking torrents and pausing them based on criteria
-        for torrent in qbt_client.torrents_info():
-            torrent_completed = bool(torrent.state_enum.is_complete)
-            torrent_active = bool(not torrent.state_enum.is_paused) and bool(not torrent.state_enum.is_checking) and bool(not torrent.state_enum.is_errored)
-
-            print(f'{torrent.hash[-6:]}: {torrent.name} active: ({torrent_active}) completed: ({torrent_completed})')
-
-            if not torrent_active:
-                print('Not active, continuing...')
-                continue
-            if not torrent_completed:
-                print('Not completed, continuing...')
-                continue
-            
-            tracker_list = qbt_client.torrents_trackers(torrent.hash)
-            is_public = True
-            for tracker in tracker_list:
-                if tracker.msg == 'This torrent is private':
-                    print('Private, continuing...')
-                    is_public = False
-                    break
-                if is_private(tracker.url):
-                    print('Private, continuing...')
-                    is_public = False
-                    break
-
-            if not is_public:
-                continue
-
-            print('Public! Pausing...')
-            qbt_client.torrents.pause(torrent_hashes=torrent.hash)
+        check_torrents(qbt_client)
 
         # Random delay between checks, outside the for loop but inside the while loop
         jitter = random.randint(60, 120)
@@ -125,6 +179,9 @@ def main_loop():
         time.sleep(jitter)
 
 if __name__ == "__main__":
+    # Flush each line so the container log shows every decision as it happens.
+    sys.stdout.reconfigure(line_buffering=True)
+
     # If a hash argument is provided, attempt deletion without acquiring the lock
     if len(sys.argv) > 1:
         delete_torrent_by_hash(sys.argv[1])
